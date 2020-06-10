@@ -37,7 +37,6 @@ fn make_shim<'tcx>(tcx: TyCtxt<'tcx>, instance: ty::InstanceDef<'tcx>) -> Body<'
             instance,
             Some(Adjustment::DerefMove),
             CallKind::Direct(def_id),
-            None,
         ),
         ty::InstanceDef::FnPtrShim(def_id, ty) => {
             // FIXME(eddyb) support generating shims for a "shallow type",
@@ -51,16 +50,8 @@ fn make_shim<'tcx>(tcx: TyCtxt<'tcx>, instance: ty::InstanceDef<'tcx>) -> Body<'
                 Some(ty::ClosureKind::FnMut | ty::ClosureKind::Fn) => Adjustment::Deref,
                 None => bug!("fn pointer {:?} is not an fn", ty),
             };
-            // HACK: we need the "real" argument types for the MIR,
-            // but because our substs are (Self, Args), where Args
-            // is a tuple, we must include the *concrete* argument
-            // types in the MIR. They will be substituted again with
-            // the param-substs, but because they are concrete, this
-            // will not do any harm.
-            let sig = tcx.erase_late_bound_regions(&ty.fn_sig(tcx));
-            let arg_tys = sig.inputs();
-
-            build_call_shim(tcx, instance, Some(adjustment), CallKind::Indirect, Some(arg_tys))
+            
+            build_call_shim(tcx, instance, Some(adjustment), CallKind::Indirect)
         }
         // We are generating a call back to our def-id, which the
         // codegen backend knows to turn to an actual call, be it
@@ -68,7 +59,7 @@ fn make_shim<'tcx>(tcx: TyCtxt<'tcx>, instance: ty::InstanceDef<'tcx>) -> Body<'
         // indirect calls must be codegen'd differently than direct ones
         // (such as `#[track_caller]`).
         ty::InstanceDef::ReifyShim(def_id) => {
-            build_call_shim(tcx, instance, None, CallKind::Direct(def_id), None)
+            build_call_shim(tcx, instance, None, CallKind::Direct(def_id))
         }
         ty::InstanceDef::ClosureOnceShim { call_once: _ } => {
             let fn_mut = tcx.require_lang_item(FnMutTraitLangItem, None);
@@ -84,7 +75,6 @@ fn make_shim<'tcx>(tcx: TyCtxt<'tcx>, instance: ty::InstanceDef<'tcx>) -> Body<'
                 instance,
                 Some(Adjustment::RefMut),
                 CallKind::Direct(call_mut),
-                None,
             )
         }
         ty::InstanceDef::DropGlue(def_id, ty) => {
@@ -654,25 +644,21 @@ impl CloneShimBuilder<'tcx> {
 /// Builds a "call" shim for `instance`. The shim calls the
 /// function specified by `call_kind`, first adjusting its first
 /// argument according to `rcvr_adjustment`.
-///
-/// If `untuple_args` is a vec of types, the second argument of the
-/// function will be untupled as these types.
 fn build_call_shim<'tcx>(
     tcx: TyCtxt<'tcx>,
     instance: ty::InstanceDef<'tcx>,
     rcvr_adjustment: Option<Adjustment>,
     call_kind: CallKind,
-    untuple_args: Option<&[Ty<'tcx>]>,
 ) -> Body<'tcx> {
     debug!(
-        "build_call_shim(instance={:?}, rcvr_adjustment={:?}, \
-            call_kind={:?}, untuple_args={:?})",
-        instance, rcvr_adjustment, call_kind, untuple_args
+        "build_call_shim(instance={:?}, rcvr_adjustment={:?}, call_kind={:?})",
+        instance, rcvr_adjustment, call_kind,
     );
 
     let def_id = instance.def_id();
     let sig = tcx.fn_sig(def_id);
     let mut sig = tcx.erase_late_bound_regions(&sig);
+    let mut untuple_args = None;
 
     // FIXME(eddyb) avoid having this snippet both here and in
     // `Instance::fn_sig` (introduce `InstanceDef::fn_sig`?).
@@ -683,6 +669,15 @@ fn build_call_shim<'tcx>(
         debug_assert!(tcx.generics_of(def_id).has_self && *self_arg == tcx.types.self_param);
         *self_arg = tcx.mk_mut_ptr(*self_arg);
         sig.inputs_and_output = tcx.intern_type_list(&inputs_and_output);
+    } else if let ty::InstanceDef::FnPtrShim(_, ty) = instance {
+        // HACK: we need the "real" argument types for the MIR,
+        // but because our substs are (Self, Args), where Args
+        // is a tuple, we must include the *concrete* argument
+        // types in the MIR. They will be substituted again with
+        // the param-substs, but because they are concrete, this
+        // will not do any harm.
+        sig = tcx.erase_late_bound_regions(&ty.fn_sig(tcx));
+        untuple_args = Some(sig.inputs());
     }
 
     let span = tcx.def_span(def_id);
